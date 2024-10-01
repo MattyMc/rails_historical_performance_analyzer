@@ -1,0 +1,402 @@
+#!/bin/bash
+
+# =============================================================================
+# Script Name: performance_analyzer
+# Description:
+#   Measures the execution time of a specified command over a series of commits
+#   in a Rails application. Outputs a summary table of the commit hash, commit
+#   date, and execution time statistics (median, minimum, and maximum).
+#
+# Usage:
+#   bin/performance_analyzer [options] -- [command_to_test] [args...]
+#
+# Options:
+#   -c, --commits NUMBER         Number of commits to test (default: 10)
+#   -r, --runs NUMBER            Number of times to run the command per commit
+#                                (default: 1)
+#   -s, --skip NUMBER            Number of commits to skip between tests (default: 0)
+#   --start-hash COMMIT_HASH     Starting commit hash to begin testing from
+#   -h, --help                   Display this help message
+#
+# Example:
+#   To test 'bin/rails runner ""' starting from commit '89834c11', testing 5 commits,
+#   skipping 3 commits between tests, and running 3 times each:
+#     bin/performance_analyzer -c 5 -r 3 -s 3 --start-hash 89834c11 -- bin/rails runner ""
+#
+# Requirements:
+#   - Bash shell installed on your system.
+#   - Place the script in the 'bin' directory of your Rails app.
+#   - Ensure the script has execute permissions:
+#     chmod +x bin/performance_analyzer
+#
+# Notes:
+#   - The script checks for uncommitted or untracked changes and will stop if any
+#     are detected to prevent conflicts.
+#   - It's recommended to commit or stash any local changes before running the script.
+#   - The script uses the 'time' command to measure execution time.
+#   - The script ensures it switches back to your original branch even if errors occur.
+#   - Results are saved in the 'tmp' directory to avoid tracking by Git.
+# =============================================================================
+
+# We will handle errors manually to allow the script to continue after certain failures
+set +e
+
+# Default values
+n=10               # Number of commits
+num_runs=1         # Number of runs per commit
+skip=0             # Number of commits to skip between tests
+start_hash=""      # Starting commit hash
+
+# Function to display help message
+function display_help {
+  echo "Usage: bin/performance_analyzer [options] -- [command_to_test] [args...]"
+  echo ""
+  echo "Options:"
+  echo "  -c, --commits NUMBER         Number of commits to test (default: 10)"
+  echo "  -r, --runs NUMBER            Number of times to run the command per commit (default: 1)"
+  echo "  -s, --skip NUMBER            Number of commits to skip between tests (default: 0)"
+  echo "  --start-hash COMMIT_HASH     Starting commit hash to begin testing from"
+  echo "  -h, --help                   Display this help message"
+  echo ""
+  echo "Example:"
+  echo "  bin/performance_analyzer -c 5 -r 3 -s 3 --start-hash 89834c11 -- bin/rails runner \"\""
+  exit 0
+}
+
+# Function to switch back to the original branch upon script exit
+function cleanup {
+  echo ""
+  echo "🔙 Returning to your original branch '$current_branch'..."
+  git checkout "$current_branch" --quiet
+}
+
+# Function to measure execution time of a command
+function measure_time {
+  local output elapsed
+  # Suppress command's stdout
+  output=$( { /usr/bin/time -p "${command_to_test[@]}" >/dev/null; } 2>&1 )
+  # Extract the real time
+  elapsed=$(echo "$output" | awk '/^real/ {print $2}')
+  # Convert to seconds with two decimal places
+  printf "%.2f" "$elapsed"
+}
+
+# Add monitoring to detect resource usage spikes, and halt or pause 
+# the script if system resources get too high
+function check_resource_usage {
+  # Get the free and inactive memory from `vm_stat`
+  pages_free=$(vm_stat | grep 'Pages free' | awk '{print $3}' | sed 's/\.//')
+  pages_inactive=$(vm_stat | grep 'Pages inactive' | awk '{print $3}' | sed 's/\.//')
+  
+  # Get the page size (usually 4096 bytes on macOS)
+  page_size=$(sysctl -n hw.pagesize)
+
+  # Calculate the available memory in MB
+  free_mem=$(( (pages_free + pages_inactive) * page_size / 1024 / 1024 ))
+
+  echo "Memory Check: ${free_mem}MB remaining."
+
+  # Check if free memory is below the threshold (1000MB)
+  if [ "$free_mem" -lt 1000 ]; then
+    echo "⚠️ Low memory detected: ${free_mem}MB remaining. Pausing script."
+    sleep 10  # Pause to allow memory recovery or external intervention
+  fi
+}
+
+function check_ruby_version {
+  # Check if a .ruby-version file exists in this commit
+  if [ -f ".ruby-version" ]; then
+    local_ruby_version=$(cat .ruby-version)
+  else
+    local_ruby_version=$(grep -A 1 "RUBY VERSION" Gemfile.lock | tail -n 1 | awk '{print $2}')
+  fi
+
+  # Check if the specified Ruby / Bundler version is installed
+  required_bundler_version=$(grep -A 1 "BUNDLED WITH" Gemfile.lock | tail -n 1 | tr -d ' ')
+  if rbenv versions | grep -q "$local_ruby_version"; then
+    echo "   • Using Ruby v$local_ruby_version (installed) with Bundler v$required_bundler_version"
+  else
+    echo "   • Using Ruby v$local_ruby_version (not installed, attempting to install) with Bundler v$required_bundler_version"
+    rbenv install "$local_ruby_version"
+  fi
+  
+  # Install correct Bundler version
+  required_bundler_version=$(grep -A 1 "BUNDLED WITH" Gemfile.lock | tail -n 1 | tr -d ' ')
+  gem install bundler -v "$required_bundler_version" > /dev/null 2>&1
+  # Run rbenv rehash to ensure the new Bundler is correctly set up
+  rbenv rehash
+}
+
+# Function to display the summary
+function display_summary {
+  # Check if all commits were processed
+  if [[ $commit_index -gt $total_commits ]]; then
+      echo ""
+      echo "🎉 All done! Performance results saved to '$results_file'."
+  else
+      echo ""
+      echo "📊 Summary of Performance Results (Partial due to interruption):"
+  fi
+
+  echo "------------------------------------------------------------"
+
+  # Format the results table
+  column -t -s $'\t' "$results_file"
+
+  echo "------------------------------------------------------------"
+  echo "💾 Performance results saved to '$results_file'."
+
+  echo "💡 To view the performance logs for all commits in VS Code, run the following command:"
+  echo "   code $log_file"
+
+  # If there were any failed commits, display them
+  if [ ${#failed_commits[@]} -gt 0 ]; then
+      echo ""
+      echo "⚠️  The following commits encountered errors and were skipped:"
+      for failed_commit in "${failed_commits[@]}"; do
+          echo " - $failed_commit"
+      done
+  fi
+}
+
+# Trap to catch script exit and errors to run the cleanup
+trap 'cleanup; display_summary' EXIT ERR
+
+# Check for uncommitted or untracked changes
+if [[ -n $(git status --porcelain) ]]; then
+  echo "🚫 Uncommitted or untracked changes detected."
+  echo "Please commit or stash your changes before running this script."
+  exit 1
+fi
+
+# Save the current Git branch
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -c|--commits)
+      n="$2"
+      shift 2
+      ;;
+    -r|--runs)
+      num_runs="$2"
+      shift 2
+      ;;
+    -s|--skip)
+      skip="$2"
+      shift 2
+      ;;
+    --start-hash)
+      start_hash="$2"
+      shift 2
+      ;;
+    -h|--help)
+      display_help
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1"
+      display_help
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# Check if a command to test was provided
+if [ -z "$1" ]; then
+  echo "❌ No command specified to test."
+  echo "Usage: bin/performance_analyzer [options] -- [command_to_test] [args...]"
+  exit 1
+else
+  # Store the command and its arguments as an array
+  command_to_test=("$@")
+fi
+
+# Generate the list of commits
+if [ -n "$start_hash" ]; then
+  # Start from the specified commit hash
+  if git cat-file -e "${start_hash}^{commit}" 2>/dev/null; then
+    commit_range="${start_hash}"
+  else
+    echo "❌ Starting commit hash '$start_hash' not found."
+    exit 1
+  fi
+else
+  # Start from HEAD
+  commit_range="HEAD"
+fi
+
+# Get the list of commits only from the current branch, using --first-parent to avoid traversing other branches
+all_commits=$(git rev-list --first-parent "$commit_range")
+
+# Build the list of commits to process
+commits_to_process=()
+count=0
+for commit in $all_commits; do
+  if [ ${#commits_to_process[@]} -ge "$n" ]; then
+    break
+  fi
+  if [ $((count % (skip + 1))) -eq 0 ]; then
+    # Include this commit
+    commits_to_process+=("$commit")
+  fi
+  count=$((count + 1))
+done
+
+# Check if any commits were found
+if [ ${#commits_to_process[@]} -eq 0 ]; then
+  echo "❌ No commits found with the specified options."
+  exit 1
+fi
+
+# Create the 'tmp' directory if it doesn't exist
+mkdir -p tmp
+
+# Create a results file
+results_file="tmp/performance_results.txt"
+
+# Write the header to the results file
+echo -e "Commit\tDate\tMedian\tMin\tMax" > "$results_file"
+
+# Output the description of what the script will do
+log_file="tmp/performance_output_all_commits.txt"
+echo "⏳ Starting performance tests. Logs will be saved to $log_file" > "$log_file"
+echo "  • Number of commits to test: $n"
+echo "  • Number of runs per commit: $num_runs"
+echo "  • Number of commits to skip between tests: $skip"
+if [ -n "$start_hash" ]; then
+  echo "  • Starting from commit hash: $start_hash"
+else
+  echo "  • Starting from the most recent commit"
+fi
+echo "  • Command to test: ${command_to_test[@]}"
+echo ""
+
+# Array to store commits that failed
+failed_commits=()
+
+# Total number of commits
+total_commits=${#commits_to_process[@]}
+commit_index=1
+
+# Loop through each commit
+for commit in "${commits_to_process[@]}"; do
+  echo ""
+  commit_hash=$(git rev-parse --short "$commit")
+
+  # Checkout the specific commit
+  git checkout "$commit" --quiet
+
+  # Get the commit date (only date part)
+  commit_date=$(git show -s --format=%cd --date=short "$commit")
+  echo "🟢 ${commit_index}/${total_commits} Testing commit $commit_hash ($commit_date)..."
+
+  # Call the function to set up Ruby version
+  check_ruby_version
+
+  # Install dependencies
+  echo "   • Installing dependencies..."
+  if ! bundle install --quiet; then
+    echo "❌ Failed to install dependencies on commit $commit_hash"
+    bundle install
+    failed_commits+=("$commit_hash")
+    commit_index=$((commit_index + 1))
+    continue  # Skip to the next commit
+  fi
+
+  # Initialize an array to store run times
+  run_times=()
+
+  # Run the command multiple times
+  echo "  ⏱️  Testing $num_runs runs..."
+  for ((i=1; i<=num_runs; i++)); do
+
+    # Measure the execution time
+    if ! elapsed=$(measure_time); then
+      echo "❌ Command failed during execution on commit $commit_hash"
+      failed_commits+=("$commit_hash")
+      # Exit the loop for this commit and proceed to the next
+      break
+    fi
+
+    # Add the elapsed time to the array
+    run_times+=("$elapsed")
+
+    # Display the elapsed time for this run
+    echo "     $i: $elapsed seconds."
+  done
+
+  # If no run times were recorded due to failure, skip to the next commit
+  if [ ${#run_times[@]} -eq 0 ]; then
+    commit_index=$((commit_index + 1))
+    continue
+  fi
+
+  # Calculate statistics
+  # Sort the run times
+  sorted_times=($(printf '%s\n' "${run_times[@]}" | sort -n))
+
+  # Calculate min and max
+  min_time=${sorted_times[0]}
+  max_index=$((${#sorted_times[@]} - 1))
+  max_time=${sorted_times[$max_index]}
+
+  # Calculate median
+  num_elements=${#sorted_times[@]}
+  if (( num_elements == 1 )); then
+    median_time=${sorted_times[0]}
+  elif (( num_elements % 2 == 1 )); then
+    median_time=${sorted_times[$((num_elements / 2))]}
+  else
+    lower=${sorted_times[$((num_elements / 2 - 1))]}
+    upper=${sorted_times[$((num_elements / 2))]}
+    median_time=$(echo "scale=2; ($lower + $upper) / 2" | bc)
+  fi
+
+  # Display the statistics for this commit
+  echo "  ✅ Results, Min - Median - Max:"
+  echo "     $min_time - $median_time - $max_time (s)"
+
+  # Append the statistics to the results file
+  echo -e "$commit_hash\t$commit_date\t$median_time\t$min_time\t$max_time" >> "$results_file"
+
+  # Clear the run times array
+  unset run_times
+
+  # Reset the Ruby environment after processing each commit
+  # rvm reset # > /dev/null 2>&1
+
+  # Check memory usage
+  check_resource_usage
+
+  # Increment the commit index
+  commit_index=$((commit_index + 1))
+done
+
+# The 'cleanup' function will handle switching back to the original branch
+
+# Display the summary
+echo ""
+echo "📊 Summary of Performance Results:"
+echo "------------------------------------------------------------"
+
+# Format the results table
+column -t -s $'\t' "$results_file"
+
+echo "------------------------------------------------------------"
+echo "🎉 All done! Performance results saved to '$results_file'."
+
+# If there were any failed commits, display them
+if [ ${#failed_commits[@]} -gt 0 ]; then
+  echo ""
+  echo "⚠️  The following commits encountered errors and were skipped:"
+  for failed_commit in "${failed_commits[@]}"; do
+    echo " - $failed_commit"
+  done
+fi
