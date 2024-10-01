@@ -1,2 +1,5 @@
-# rails_historical_performance_analyzer
-Bash script that analyzes the run time of a provided CLI command over the GIT history of a Ruby on Rails repo.
+# Rails Historical Performance Analyzer
+
+** Use with extreme caution, or preferably not at all.**
+
+This script is designed to analyze the run time of a provided CLI command across the history of a Rails project. See the provided file for details and examples.
